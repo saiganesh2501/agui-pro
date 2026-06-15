@@ -1,0 +1,10 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic>=2.11.2
+websockets==13.1
+openai>=1.99.0
+httpx>=0.28
+python-dotenv==1.0.1
+ag-ui-protocol>=0.1.19
+duckduckgo-search>=6.3.0
+anyio>=4.4.0
