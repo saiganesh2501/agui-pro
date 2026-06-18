@@ -8,3 +8,4 @@ python-dotenv==1.0.1
 ag-ui-protocol>=0.1.19
 duckduckgo-search>=6.3.0
 anyio>=4.4.0
+langfuse>=3.0.0
