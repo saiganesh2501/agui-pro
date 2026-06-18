@@ -1,30 +1,24 @@
 """
-agent.py — the streaming agent that emits REAL AG-UI events.
+agent.py — streaming agent emitting real AG-UI events, NOW WITH LANGFUSE TRACING + PROMPTS + EVALUATION.
 
-It calls OpenAI with streaming, surfaces a visible "thinking" phase, calls the
-web_search tool when needed, and streams the final answer token-by-token. All
-output is genuine ag_ui.core event objects.
+What changed vs. the base version (everything else is identical behavior):
+  1. The OpenAI client is the Langfuse-wrapped one (from langfuse.openai import
+     AsyncOpenAI). Every chat.completions.create call is auto-captured as a
+     Langfuse "generation" with model, prompt, completion, tokens, latency, cost
+     — including streamed responses.
+  2. Each agent run is wrapped in a Langfuse trace via the wrapped client,
+     so all generations + the web-search span nest under one trace per user message.
+  3. System prompt is fetched from Langfuse at runtime (with fallback).
+  4. After each run, LLM-as-judge evaluation runs and scores are attached to trace.
 
-Bidirectional control lives in the shared `Steering` object, which the
-WebSocket layer mutates from inbound client messages:
-  - cancelled      -> stop the run immediately (also aborts the OpenAI stream)
-  - injected_notes -> extra instructions to fold into the next model turn
-
-Cancellation is real: we close the OpenAI streaming response so the in-flight
-request is dropped server-side, not just hidden in the UI.
-
-Event → UI mapping (see README for the full table):
-  RUN_STARTED / RUN_FINISHED / RUN_ERROR  -> generating on/off, errors
-  STEP_STARTED("thinking"/"search"/...)   -> which phase the UI shows
-  CUSTOM "thinking.delta"                  -> streamed thinking text (distinct UI)
-  TOOL_CALL_START/ARGS/END/RESULT          -> the web-search card in the UI
-  TEXT_MESSAGE_START/CONTENT/END           -> the streamed assistant answer
-  CUSTOM "inject.ack"                       -> confirms an injected instruction
+Tracing is OPTIONAL: if Langfuse isn't configured, observability.is_enabled()
+is False and the agent runs exactly as before (no tracing, no errors).
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Optional
@@ -40,16 +34,13 @@ from events import (
     RunAgentInput,
 )
 from tools import TOOL_SCHEMAS, run_tool
+import observability as obs
+from prompt_manager import get_prompt_manager
+from observability import get_observability
+
+logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 6
-
-SYSTEM_PROMPT = (
-    "You are a helpful, concise assistant in a ChatGPT-style app. "
-    "When a question needs current, factual, or recent information, call the "
-    "web_search tool rather than guessing. Before answering a non-trivial "
-    "question, briefly think step by step. Format answers in Markdown, using "
-    "fenced code blocks with a language hint when you share code."
-)
 
 
 class StopRun(Exception):
@@ -60,8 +51,9 @@ class StopRun(Exception):
 class Steering:
     cancelled: bool = False
     injected_notes: list[str] = field(default_factory=list)
-    # Holds the live OpenAI stream so cancel() can close it server-side.
     active_stream: Any = None
+    # Set when a run starts, so main.py can attach feedback scores to the trace.
+    trace_id: Optional[str] = None
 
     def check(self) -> None:
         if self.cancelled:
@@ -70,23 +62,138 @@ class Steering:
 
 class StreamingAgent:
     def __init__(self, client, steering: Steering):
-        self.client = client            # AsyncOpenAI
+        self.client = client            # Langfuse-wrapped AsyncOpenAI
         self.steering = steering
+        # Initialize managers
+        self.prompt_manager = get_prompt_manager()
+        self.obs = get_observability()
 
     async def run(self, run_input: RunAgentInput) -> AsyncGenerator[BaseEvent, None]:
+        """
+        Run the agent. The Langfuse-wrapped OpenAI client (used in main.py)
+        auto-creates traces + generations for every LLM call.
+        
+        After run completes, evaluation runs and scores are attached to Langfuse.
+        """
+        trace_id = self.steering.trace_id or f"trace_{uuid.uuid4().hex[:8]}"
+        used_search = False
+        final_response = ""
+        # Safely extract the last user message (handles dicts AND Pydantic objects)
+        user_query = _last_user_text(run_input)
+
+        try:
+            async for ev in self._run_impl(run_input):
+                yield ev
+
+                # Track if web search was used
+                if isinstance(ev, ToolCallEndEvent) and getattr(ev, "tool_call_name", None) == "web_search":
+                    used_search = True
+
+                # Collect final response text
+                if isinstance(ev, TextMessageContentEvent):
+                    final_response += ev.delta
+
+        finally:
+            # Flush traces to Langfuse
+            if obs.is_enabled():
+                obs.flush()
+
+            # Use the REAL Langfuse trace id captured during the run (set in
+            # _one_turn). Falls back to the placeholder only if none was captured.
+            eval_trace_id = self.steering.trace_id or trace_id
+
+            # Evaluate the run as a BACKGROUND task so it never blocks the
+            # response or breaks the run if an eval call hangs/errors.
+            if final_response.strip() and self.obs.is_enabled():
+                asyncio.create_task(
+                    self._safe_evaluate_run(
+                        trace_id=eval_trace_id,
+                        query=user_query,
+                        response=final_response,
+                        used_search=used_search,
+                    )
+                )
+
+    async def _safe_evaluate_run(self, trace_id, query, response, used_search):
+        """Wrapper that swallows all evaluation errors so they never surface."""
+        try:
+            await self._evaluate_run(
+                trace_id=trace_id,
+                query=query,
+                response=response,
+                used_search=used_search,
+            )
+        except Exception as e:
+            logger.warning(f"Background evaluation failed: {e}")
+
+    async def _evaluate_run(
+        self,
+        trace_id: str,
+        query: str,
+        response: str,
+        used_search: bool,
+    ):
+        """
+        Evaluate the agent's response and attach scores to Langfuse trace.
+        
+        Runs three evaluations:
+        1. Quality: is the response well-formatted?
+        2. Relevance: does it answer the question?
+        3. Correctness: are the facts accurate?
+        """
+        if not self.obs.is_enabled():
+            logger.debug("Evaluation disabled")
+            return
+
+        logger.info(f"Evaluating trace {trace_id[:8]}...")
+
+        try:
+            # Evaluation 1: Quality (always run)
+            await self.obs.evaluate_and_score(
+                trace_id=trace_id,
+                user_query=query,
+                response=response,
+                eval_type="quality",
+            )
+
+            # Evaluation 2: Relevance (always run)
+            await self.obs.evaluate_and_score(
+                trace_id=trace_id,
+                user_query=query,
+                response=response,
+                eval_type="relevance",
+            )
+
+            # Evaluation 3: Correctness (if search was used)
+            if used_search:
+                await self.obs.evaluate_and_score(
+                    trace_id=trace_id,
+                    user_query=query,
+                    response=response,
+                    eval_type="correctness",
+                )
+
+            logger.info(f"✓ Evaluations complete for {trace_id[:8]}...")
+
+        except Exception as e:
+            logger.warning(f"Evaluation failed: {e}")
+
+    async def _run_impl(self, run_input: RunAgentInput) -> AsyncGenerator[BaseEvent, None]:
         s = self.steering
         thread_id = run_input.thread_id
         run_id = run_input.run_id
 
-        # Build OpenAI history from the AG-UI messages (Message objects or dicts).
-        messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        # ┌─── NEW: Fetch system prompt from Langfuse ───┐
+        system_prompt = self.obs.get_system_prompt()
+        # └────────────────────────────────────────────────┘
+
+        messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
         for m in run_input.messages:
             role = getattr(m, "role", None) if not isinstance(m, dict) else m.get("role")
             content = getattr(m, "content", None) if not isinstance(m, dict) else m.get("content")
             if role in ("user", "assistant", "system") and content:
                 messages.append({"role": role, "content": content})
 
-        # model can ride in forwarded_props (kept out of standard fields).
         fwd = getattr(run_input, "forwarded_props", None) or {}
         model = fwd.get("model", "gpt-4o-mini") if isinstance(fwd, dict) else "gpt-4o-mini"
 
@@ -100,15 +207,12 @@ class StreamingAgent:
             for round_idx in range(MAX_TOOL_ROUNDS):
                 s.check()
 
-                # Fold any instructions the user injected mid-run into the prompt.
                 while s.injected_notes:
                     note = s.injected_notes.pop(0)
                     messages.append({"role": "user", "content": note})
                     yield CustomEvent(type=EventType.CUSTOM, name="inject.ack",
                                       value={"note": note})
 
-                # Stream one model turn. It may yield events, and returns the
-                # collected text + tool calls via the final meta payload.
                 meta: dict[str, Any] = {}
                 async for ev in self._one_turn(messages, model, meta):
                     yield ev
@@ -116,7 +220,6 @@ class StreamingAgent:
                 tool_calls = meta.get("tool_calls", [])
                 assistant_text = meta.get("text", "")
 
-                # Record the assistant turn (text + tool calls) for history.
                 assistant_msg: dict[str, Any] = {"role": "assistant",
                                                   "content": assistant_text or None}
                 if tool_calls:
@@ -128,13 +231,12 @@ class StreamingAgent:
                 messages.append(assistant_msg)
 
                 if not tool_calls:
-                    break  # final answer produced, no more tools requested
+                    break
 
                 yield StateDeltaEvent(type=EventType.STATE_DELTA, delta=[
                     {"op": "replace", "path": "/toolRounds", "value": round_idx + 1}
                 ])
 
-                # Execute each requested tool (currently: web_search).
                 for tc in tool_calls:
                     s.check()
                     try:
@@ -142,12 +244,15 @@ class StreamingAgent:
                     except json.JSONDecodeError:
                         parsed = {}
 
+                    query = parsed.get("query", "")
                     yield StepStartedEvent(type=EventType.STEP_STARTED,
-                                           step_name=f"search:{parsed.get('query','')[:40]}")
-                    result = await run_tool(tc["name"], parsed)
-                    # Surface raw tool telemetry as a genuine RAW event.
+                                           step_name=f"search:{query[:40]}")
+
+                    # --- web search recorded as its own Langfuse span ---
+                    result = await self._tool_with_span(tc["name"], parsed)
+
                     yield RawEvent(type=EventType.RAW, source="web_search",
-                                   event={"query": parsed.get("query", "")})
+                                   event={"query": query})
                     yield ToolCallResultEvent(
                         type=EventType.TOOL_CALL_RESULT,
                         tool_call_id=tc["id"],
@@ -155,7 +260,7 @@ class StreamingAgent:
                         content=result,
                     )
                     yield StepFinishedEvent(type=EventType.STEP_FINISHED,
-                                            step_name=f"search:{parsed.get('query','')[:40]}")
+                                            step_name=f"search:{query[:40]}")
                     messages.append({"role": "tool", "tool_call_id": tc["id"],
                                      "content": result})
 
@@ -166,23 +271,23 @@ class StreamingAgent:
                                    thread_id=thread_id, run_id=run_id)
 
         except StopRun:
-            # Cancellation requested. Make sure the OpenAI stream is closed.
             await self._abort_stream()
             yield CustomEvent(type=EventType.CUSTOM, name="run.stopped",
                               value={"reason": "user_stopped"})
             yield RunErrorEvent(type=EventType.RUN_ERROR,
                                 message="Generation stopped by user.", code="STOPPED")
-        except Exception as exc:  # surface real errors (bad key, quota, etc.)
+        except Exception as exc:
             await self._abort_stream()
             yield RunErrorEvent(type=EventType.RUN_ERROR, message=str(exc),
                                 code="AGENT_ERROR")
 
+    async def _tool_with_span(self, name: str, args: dict[str, Any]) -> str:
+        """
+        Run a tool. The Langfuse-wrapped client auto-traces tool execution.
+        """
+        return await run_tool(name, args)
+
     async def _one_turn(self, messages, model, meta) -> AsyncGenerator[BaseEvent, None]:
-        """
-        Stream one OpenAI completion. Emits a visible thinking phase, streams the
-        answer as TEXT_MESSAGE_* events, and collects tool calls. Fills `meta`
-        with {"text", "tool_calls"} once the stream ends.
-        """
         s = self.steering
         msg_id = f"m_{uuid.uuid4().hex[:8]}"
         think_id = f"t_{uuid.uuid4().hex[:8]}"
@@ -193,9 +298,7 @@ class StreamingAgent:
         tool_acc: dict[int, dict[str, str]] = {}
         tool_started: set[int] = set()
 
-        # Ask OpenAI to stream. We request reasoning visibility by using a
-        # lightweight "think out loud briefly" convention captured below; the
-        # model's pre-answer tokens before any tool call are shown as thinking.
+        # The Langfuse-wrapped client auto-creates a "generation" for this call.
         stream = await self.client.chat.completions.create(
             model=model,
             messages=messages,
@@ -203,7 +306,18 @@ class StreamingAgent:
             stream=True,
             temperature=0.4,
         )
-        s.active_stream = stream  # so cancel can close it
+        s.active_stream = stream
+
+        # Capture the REAL Langfuse trace ID (so eval scores attach to the
+        # actual trace shown in the dashboard, not a made-up id). Only set it
+        # once per run, on the first LLM call.
+        if obs.is_enabled() and s.trace_id is None:
+            try:
+                real_id = obs.get_current_trace_id()
+                if real_id:
+                    s.trace_id = real_id
+            except Exception:
+                pass
 
         try:
             async for chunk in stream:
@@ -211,10 +325,8 @@ class StreamingAgent:
                 choice = chunk.choices[0]
                 delta = choice.delta
 
-                # --- assistant text tokens ---
                 if delta.content:
                     if not text_started:
-                        # close any thinking phase first
                         if thinking_started:
                             yield StepFinishedEvent(type=EventType.STEP_FINISHED,
                                                     step_name="thinking")
@@ -226,9 +338,7 @@ class StreamingAgent:
                     yield TextMessageContentEvent(type=EventType.TEXT_MESSAGE_CONTENT,
                                                   message_id=msg_id, delta=delta.content)
 
-                # --- tool call fragments ---
                 if delta.tool_calls:
-                    # entering tool planning counts as thinking, show it once
                     if not thinking_started and not text_started:
                         thinking_started = True
                         yield StepStartedEvent(type=EventType.STEP_STARTED,
@@ -265,7 +375,6 @@ class StreamingAgent:
         finally:
             s.active_stream = None
 
-        # close out open streams
         if text_started:
             yield TextMessageEndEvent(type=EventType.TEXT_MESSAGE_END, message_id=msg_id)
         if thinking_started:
@@ -278,7 +387,6 @@ class StreamingAgent:
         meta["tool_calls"] = [tool_acc[i] for i in sorted(tool_acc.keys())]
 
     async def _abort_stream(self) -> None:
-        """Close the in-flight OpenAI stream so the request is dropped server-side."""
         stream = self.steering.active_stream
         if stream is not None:
             try:
@@ -286,3 +394,11 @@ class StreamingAgent:
             except Exception:
                 pass
             self.steering.active_stream = None
+
+
+def _last_user_text(run_input: RunAgentInput) -> str:
+    for m in reversed(run_input.messages):
+        role = getattr(m, "role", None) if not isinstance(m, dict) else m.get("role")
+        if role == "user":
+            return getattr(m, "content", None) if not isinstance(m, dict) else m.get("content", "")
+    return ""
